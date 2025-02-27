@@ -1,0 +1,11 @@
+flask==2.0.1
+pytube==12.1.0
+numpy==1.23.5
+moviepy==1.0.3
+pysrt==1.1.2
+SpeechRecognition==3.10.0
+pydub==0.25.1
+ffmpeg-python==0.2.0
+webrtcvad==2.0.10
+werkzeug==2.0.1
+gunicorn==20.1.0
