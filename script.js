@@ -36,14 +36,30 @@ document.addEventListener('DOMContentLoaded', function() {
             return;
         }
         
+        const file = fileInput.files[0];
+        console.log('Uploading file:', file.name, 'Size:', file.size, 'Type:', file.type);
+        
+        if (file.size > 100 * 1024 * 1024) {  // 100MB limit
+            alert('حجم الملف كبير جدًا. الحد الأقصى هو 100 ميجابايت.');
+            return;
+        }
+        
+        // Check if file is a video
+        if (!file.type.startsWith('video/')) {
+            alert('الرجاء اختيار ملف فيديو صالح.');
+            return;
+        }
+        
         const formData = new FormData();
-        formData.append('video', fileInput.files[0]);
+        formData.append('video', file);
         formData.append('language', languageSelect.value);
         
-        // Show loading indicator
-        loadingIndicator.style.display = 'block';
-        resultContent.style.display = 'none';
-        progressInfo.textContent = 'جاري تحميل الفيديو...';
+        // Show loading indicator and hide other containers
+        document.getElementById('progress-container').style.display = 'block';
+        document.getElementById('error-container').style.display = 'none';
+        document.getElementById('result-container').style.display = 'none';
+        document.getElementById('progress-info').textContent = 'جاري تحميل الفيديو...';
+        document.getElementById('progress-bar').style.width = '0%';
         
         // Send request
         fetch('/process', {
@@ -69,17 +85,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 throw new Error('استجابة غير صالحة من الخادم');
             }
         })
-        .catch(error => {
-            console.error('Error uploading file:', error);
-            loadingIndicator.style.display = 'none';
-            
-            const errorDiv = document.createElement('div');
-            errorDiv.className = 'error';
-            errorDiv.textContent = `خطأ: ${error.message}`;
-            resultContent.innerHTML = '';
-            resultContent.appendChild(errorDiv);
-            resultContent.style.display = 'block';
-        });
+        .catch(error => handleError(error, 'حدث خطأ أثناء تحميل الفيديو'));
     });
     
     // Handle YouTube form submission
@@ -94,13 +100,21 @@ document.addEventListener('DOMContentLoaded', function() {
             return;
         }
         
-        // Show loading indicator
-        loadingIndicator.style.display = 'block';
-        resultContent.style.display = 'none';
-        progressInfo.textContent = 'جاري تحميل الفيديو من يوتيوب...';
+        // Validate YouTube URL
+        if (!youtubeUrl.match(/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.?be)\/.+$/)) {
+            alert('الرجاء إدخال رابط يوتيوب صالح');
+            return;
+        }
         
-        // Send request
-        fetch('/process', {
+        // Show loading indicator and hide other containers
+        document.getElementById('progress-container').style.display = 'block';
+        document.getElementById('error-container').style.display = 'none';
+        document.getElementById('result-container').style.display = 'none';
+        document.getElementById('progress-info').textContent = 'جاري تحميل الفيديو من يوتيوب...';
+        document.getElementById('progress-bar').style.width = '0%';
+        
+        // Send request to the correct endpoint
+        fetch('/process_youtube', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
@@ -129,42 +143,98 @@ document.addEventListener('DOMContentLoaded', function() {
                 throw new Error('استجابة غير صالحة من الخادم');
             }
         })
-        .catch(error => {
-            console.error('Error processing YouTube video:', error);
-            loadingIndicator.style.display = 'none';
-            
-            const errorDiv = document.createElement('div');
-            errorDiv.className = 'error';
-            errorDiv.textContent = `خطأ: ${error.message}`;
-            resultContent.innerHTML = '';
-            resultContent.appendChild(errorDiv);
-            resultContent.style.display = 'block';
-        });
+        .catch(error => handleError(error, 'حدث خطأ أثناء تحميل الفيديو من يوتيوب'));
     });
     
+    // Add CSS to improve visibility of result container
+    document.head.insertAdjacentHTML('beforeend', `
+<style>
+#result-container {
+    margin-top: 20px;
+    padding: 15px;
+    border: 1px solid #ddd;
+    border-radius: 5px;
+    background-color: #f9f9f9;
+}
+
+.srt-preview {
+    max-height: 300px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    font-family: monospace;
+    padding: 10px;
+    border: 1px solid #ccc;
+    background-color: white;
+    direction: ltr;
+    text-align: left;
+    margin-bottom: 15px;
+}
+
+.download-btn {
+    background-color: #4CAF50;
+    color: white;
+    padding: 10px 15px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 16px;
+    display: block;
+    margin: 10px auto;
+}
+
+.download-btn:hover {
+    background-color: #45a049;
+}
+
+.warning {
+    background-color: #fff3cd;
+    color: #856404;
+    padding: 10px;
+    border-radius: 4px;
+    margin-bottom: 10px;
+}
+</style>
+`);
+    
     function displayResult(data) {
-        // Hide loading indicator
-        loadingIndicator.style.display = 'none';
-        progressInfo.textContent = '';
+        console.log('Displaying result:', data);
         
-        // Show result content
-        resultContent.style.display = 'block';
+        // Hide progress container
+        document.getElementById('progress-container').style.display = 'none';
+        
+        // Show result container
+        document.getElementById('result-container').style.display = 'block';
+        
+        // Get references to elements
+        const srtPreview = document.querySelector('.srt-preview');
+        const downloadBtn = document.querySelector('.download-btn');
         
         // Display warning if any
         if (data.warning) {
             const warningDiv = document.createElement('div');
             warningDiv.className = 'warning';
             warningDiv.textContent = data.warning;
-            resultContent.prepend(warningDiv);
+            document.getElementById('result-container').prepend(warningDiv);
         }
         
         // Display SRT preview
         const content = data.srt_content || data.subtitles;
-        srtPreview.textContent = content;
+        if (content) {
+            srtPreview.textContent = content;
+            console.log('SRT content length:', content.length);
+        } else {
+            console.error('No SRT content found in data:', data);
+            srtPreview.textContent = 'لم يتم العثور على محتوى الترجمة';
+        }
         
         // Setup download button
         downloadBtn.onclick = function() {
             const content = data.srt_content || data.subtitles;
+            if (!content) {
+                alert('لا يوجد محتوى للتنزيل');
+                return;
+            }
+            
             const blob = new Blob([content], { type: 'text/srt' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -186,7 +256,14 @@ document.addEventListener('DOMContentLoaded', function() {
         
         console.log(`Checking progress for task: ${taskId}`);
         
-        fetch(`/progress/${taskId}`)
+        fetch(`/progress/${taskId}`, {
+            method: 'GET',
+            headers: {
+                'Accept': 'application/json',
+                'Cache-Control': 'no-cache'
+            },
+            cache: 'no-store'
+        })
             .then(response => {
                 if (!response.ok) {
                     throw new Error(`HTTP error! Status: ${response.status}`);
@@ -197,37 +274,41 @@ document.addEventListener('DOMContentLoaded', function() {
                 console.log('Progress data:', data);
                 
                 if (data.status === 'completed') {
-                    console.log('Task completed');
-                    displayResult(data.result);
+                    console.log('Task completed with result:', data.result);
+                    if (data.result && (data.result.srt_content || data.result.subtitles)) {
+                        displayResult(data.result);
+                    } else {
+                        console.error('No result or content in completed task:', data);
+                        handleError(new Error('لم يتم العثور على محتوى الترجمة'), 'اكتملت المعالجة ولكن لم يتم العثور على محتوى الترجمة');
+                    }
                 } else if (data.status === 'error') {
-                    console.error('Task error:', data.error);
-                    loadingIndicator.style.display = 'none';
-                    progressInfo.textContent = '';
-                    
-                    const errorDiv = document.createElement('div');
-                    errorDiv.className = 'error';
-                    errorDiv.textContent = `خطأ: ${data.error || data.message || 'حدث خطأ غير معروف'}`;
-                    resultContent.prepend(errorDiv);
-                    resultContent.style.display = 'block';
+                    handleError(new Error(data.error || data.message || 'حدث خطأ غير معروف'), 'حدث خطأ أثناء معالجة الفيديو');
                 } else {
                     // Update progress
                     const progressPercent = data.progress || 0;
-                    progressInfo.textContent = `${data.message || 'جاري المعالجة...'} (${progressPercent}%)`;
+                    const progressBar = document.getElementById('progress-bar');
+                    progressBar.style.width = `${progressPercent}%`;
+                    document.getElementById('progress-info').textContent = `${data.message || 'جاري المعالجة...'} (${progressPercent}%)`;
                     
                     // Continue checking progress
                     setTimeout(() => checkProgress(taskId), 1000);
                 }
             })
-            .catch(error => {
-                console.error('Error checking progress:', error);
-                loadingIndicator.style.display = 'none';
-                progressInfo.textContent = '';
-                
-                const errorDiv = document.createElement('div');
-                errorDiv.className = 'error';
-                errorDiv.textContent = `خطأ في التحقق من التقدم: ${error.message}`;
-                resultContent.prepend(errorDiv);
-                resultContent.style.display = 'block';
-            });
+            .catch(error => handleError(error, 'حدث خطأ أثناء التحقق من التقدم'));
+    }
+    
+    function handleError(error, message = 'حدث خطأ أثناء المعالجة') {
+        console.error(error);
+        document.getElementById('progress-container').style.display = 'none';
+        document.getElementById('error-container').style.display = 'block';
+        document.getElementById('error-message').textContent = message;
+        
+        // Log detailed error information
+        if (error && error.message) {
+            console.error('Error details:', error.message);
+        }
+        
+        // Reset the form
+        document.getElementById('upload-form').reset();
     }
 });

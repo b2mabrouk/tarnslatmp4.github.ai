@@ -4,6 +4,7 @@ import json
 import uuid
 import threading
 import time
+import subprocess
 from datetime import timedelta
 from flask import Flask, request, jsonify, send_from_directory
 import pysrt
@@ -14,6 +15,8 @@ from pydub.silence import split_on_silence
 from pydub.playback import play
 from pydub.generators import WhiteNoise
 from pydub import effects
+import re
+from pytube import YouTube
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -50,6 +53,30 @@ except ImportError as e:
     logger.warning(f"Some dependencies could not be imported: {e}")
     logger.warning("Running in fallback mode with sample subtitles only")
 
+# Add pytube version check and workaround for HTTP 400 errors
+try:
+    import pytube
+    logger.info(f"Using pytube version: {pytube.__version__}")
+    
+    # Apply workaround for HTTP 400 errors in pytube
+    from pytube.cipher import get_throttling_function_name
+    from pytube.extract import get_ytplayer_config, apply_descrambler
+    
+    # Monkey patch for pytube cipher issues
+    original_get_throttling_function_name = get_throttling_function_name
+    
+    def patched_get_throttling_function_name(js):
+        try:
+            return original_get_throttling_function_name(js)
+        except Exception as e:
+            logger.warning(f"Error in get_throttling_function_name: {e}")
+            return "a"
+    
+    pytube.cipher.get_throttling_function_name = patched_get_throttling_function_name
+    logger.info("Applied pytube HTTP 400 error workaround")
+except Exception as e:
+    logger.warning(f"Could not apply pytube workaround: {e}")
+
 # Try to import advanced voice activity detection
 vad_available = False
 try:
@@ -59,6 +86,15 @@ try:
     logger.info("WebRTC VAD initialized successfully")
 except ImportError as e:
     logger.warning(f"WebRTC VAD not available: {e}")
+
+# Import yt-dlp as a fallback for pytube
+try:
+    import yt_dlp
+    yt_dlp_available = True
+    logger.info("yt-dlp is available as a fallback for YouTube downloads")
+except ImportError:
+    yt_dlp_available = False
+    logger.warning("yt-dlp is not available. Install it with 'pip install yt-dlp' for better YouTube download support")
 
 def process_with_vad(audio_segment, frame_duration_ms=30, padding_duration_ms=300):
     """Process audio with WebRTC Voice Activity Detection to improve speech recognition"""
@@ -167,8 +203,21 @@ def split_on_sentence_breaks(audio_segment, min_silence_len=500, silence_thresh=
                 keep_silence=200
             )
         
-        logger.info(f"Split audio into {len(chunks)} sentence chunks")
-        return chunks
+        # Ensure chunks aren't too long for optimal speech recognition
+        max_chunk_length = 10000  # 10 seconds maximum
+        final_chunks = []
+        
+        for chunk in chunks:
+            if len(chunk) > max_chunk_length:
+                # Split long chunks into smaller pieces
+                logger.info(f"Splitting long chunk of {len(chunk)/1000} seconds into smaller pieces")
+                subchunks = [chunk[i:i+max_chunk_length] for i in range(0, len(chunk), max_chunk_length)]
+                final_chunks.extend(subchunks)
+            else:
+                final_chunks.append(chunk)
+        
+        logger.info(f"Split audio into {len(final_chunks)} sentence chunks (after length optimization)")
+        return final_chunks
     except Exception as e:
         logger.error(f"Error in sentence break detection: {str(e)}")
         return []
@@ -181,77 +230,75 @@ def index():
 def serve_static(path):
     return send_from_directory('.', path)
 
-def process_youtube_video(task_id, youtube_url, language):
-    """Process YouTube video in a background thread"""
+@app.route('/process_youtube', methods=['POST'])
+def process_youtube():
+    """Process a YouTube video and generate subtitles"""
     try:
-        logger.info(f"Starting to process YouTube URL: {youtube_url}, task_id: {task_id}")
+        logger.info("Received request to process YouTube video")
         
-        # Update task status
-        tasks[task_id]['message'] = 'جاري تنزيل الفيديو من يوتيوب...'
-        tasks[task_id]['progress'] = 5
+        data = request.get_json()
         
-        # Create a temporary directory
-        temp_dir = tempfile.mkdtemp()
+        if not data:
+            logger.warning("No JSON data received in request")
+            return jsonify({'error': 'No data provided'}), 400
         
-        # Download YouTube video
-        yt = YouTube(youtube_url)
-        video_title = yt.title
+        youtube_url = data.get('youtube_url')
+        language = data.get('language', 'ar')
         
-        # Get the first stream that's progressive and has both video and audio
-        stream = yt.streams.filter(progressive=True).first()
+        if not youtube_url:
+            logger.warning("No YouTube URL provided")
+            return jsonify({'error': 'يرجى تقديم رابط يوتيوب صالح'}), 400
         
-        if not stream:
-            logger.warning("No progressive stream found, trying video-only stream")
-            stream = yt.streams.filter(only_video=True).first()
-            
-        if not stream:
-            raise Exception("No suitable video stream found")
-            
-        video_path = stream.download(output_path=temp_dir)
+        # Validate YouTube URL
+        if not is_valid_youtube_url(youtube_url):
+            logger.warning(f"Invalid YouTube URL: {youtube_url}")
+            return jsonify({'error': 'رابط يوتيوب غير صالح. يرجى التحقق من الرابط والمحاولة مرة أخرى.'}), 400
         
-        logger.info(f"Downloaded YouTube video to: {video_path}")
+        # Generate a unique task ID
+        task_id = str(uuid.uuid4())
         
-        # Update task status
-        tasks[task_id]['message'] = 'تم تنزيل الفيديو، جاري استخراج الترجمة...'
-        tasks[task_id]['progress'] = 20
-        
-        # Generate subtitles
-        subtitles = generate_subtitles_with_speech_recognition(video_path, language, task_id)
-        
-        # Update task status
-        tasks[task_id]['status'] = 'completed'
-        tasks[task_id]['progress'] = 100
-        tasks[task_id]['message'] = 'تم إنشاء الترجمة بنجاح'
-        tasks[task_id]['result'] = {
-            'srt_content': subtitles,
-            'filename': f"{video_title}.srt"
+        # Initialize task status
+        tasks[task_id] = {
+            'status': 'processing',
+            'progress': 0,
+            'message': 'بدء معالجة فيديو يوتيوب...'
         }
         
-        logger.info(f"Completed processing YouTube task {task_id}")
+        # Start processing in a background thread
+        thread = threading.Thread(target=process_youtube_video, args=(task_id, youtube_url, language))
+        thread.daemon = True
+        thread.start()
         
-        # Clean up
-        try:
-            if os.path.exists(video_path):
-                os.remove(video_path)
-                logger.info(f"Removed temporary YouTube video file: {video_path}")
-            
-            if os.path.exists(temp_dir) and not os.listdir(temp_dir):
-                os.rmdir(temp_dir)
-                logger.info(f"Removed temporary YouTube directory: {temp_dir}")
-        except Exception as e:
-            logger.warning(f"Error cleaning up temporary YouTube files: {str(e)}")
+        logger.info(f"Started YouTube processing task: {task_id}")
+        
+        return jsonify({
+            'task_id': task_id,
+            'status': 'processing',
+            'message': 'بدأت معالجة فيديو يوتيوب'
+        })
         
     except Exception as e:
-        logger.error(f"Error processing YouTube video: {str(e)}")
-        tasks[task_id]['status'] = 'error'
-        tasks[task_id]['message'] = f'حدث خطأ: {str(e)}'
-        tasks[task_id]['error'] = str(e)
+        logger.error(f"Error in process_youtube endpoint: {str(e)}")
+        return jsonify({'error': f'حدث خطأ أثناء معالجة الفيديو: {str(e)}'}), 500
+
+def is_valid_youtube_url(url):
+    """Check if the URL is a valid YouTube URL"""
+    try:
+        # Basic pattern matching for YouTube URLs
+        youtube_pattern = r'^(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[a-zA-Z0-9_-]{11}.*$'
+        return bool(re.match(youtube_pattern, url))
+    except Exception as e:
+        logger.error(f"Error validating YouTube URL: {str(e)}")
+        return False
 
 @app.route('/progress/<task_id>')
 def get_progress(task_id):
     """Get the progress of a task"""
     try:
         logger.info(f"Checking progress for task: {task_id}")
+        
+        # Add a small delay to prevent race conditions
+        time.sleep(0.1)
         
         if task_id not in tasks:
             logger.warning(f"Task ID not found: {task_id}")
@@ -262,11 +309,22 @@ def get_progress(task_id):
         # If task is completed, return the result
         if task['status'] == 'completed':
             logger.info(f"Task {task_id} is completed, returning result")
+            
+            # Ensure result has content
+            result = task.get('result', {})
+            if not result or (not result.get('srt_content') and not result.get('subtitles')):
+                logger.warning(f"Task {task_id} is completed but has no content")
+                return jsonify({
+                    'status': 'error',
+                    'message': 'اكتملت المعالجة ولكن لم يتم العثور على محتوى الترجمة',
+                    'error': 'No content found in completed task'
+                })
+            
             return jsonify({
                 'status': 'completed',
                 'progress': 100,
                 'message': task.get('message', 'تم إنشاء الترجمة بنجاح'),
-                'result': task.get('result', {})
+                'result': result
             })
         
         # If task is in error state, return the error
@@ -292,11 +350,12 @@ def get_progress(task_id):
 
 @app.route('/process', methods=['POST'])
 def process_video():
+    """Process video file or YouTube URL"""
     try:
-        logger.info("Received process request")
-        
-        # Generate a unique task ID
+        # Create a unique task ID
         task_id = str(uuid.uuid4())
+        
+        # Initialize task status
         tasks[task_id] = {
             'status': 'processing',
             'message': 'بدء معالجة الفيديو...',
@@ -325,7 +384,9 @@ def process_video():
                 })
                 
             # Process YouTube video in a background thread
-            threading.Thread(target=process_youtube_video, args=(task_id, youtube_url, language)).start()
+            thread = threading.Thread(target=process_youtube_video, args=(task_id, youtube_url, language))
+            thread.daemon = True
+            thread.start()
             
             logger.info(f"Started background thread for YouTube processing with task ID: {task_id}")
             
@@ -340,12 +401,12 @@ def process_video():
                 return jsonify({'error': 'No video file uploaded'}), 400
                 
             file = request.files['video']
-            language = request.form.get('language')
+            language = request.form.get('language', 'ar')
             
             logger.info(f"Processing uploaded file: {file.filename}, Language: {language}")
             
-            if not file or not language:
-                return jsonify({'error': 'Missing file or language'}), 400
+            if not file or file.filename == '':
+                return jsonify({'error': 'Missing file or empty filename'}), 400
             
             if not speech_recognition_available:
                 logger.warning("Speech recognition not available, returning sample subtitles")
@@ -364,10 +425,12 @@ def process_video():
             logger.info(f"Saved uploaded video to: {video_path}")
             
             # Process uploaded file in a background thread
-            threading.Thread(
+            thread = threading.Thread(
                 target=process_uploaded_file,
                 args=(task_id, video_path, filename, language)
-            ).start()
+            )
+            thread.daemon = True
+            thread.start()
             
             logger.info(f"Started background thread for file processing with task ID: {task_id}")
             
@@ -431,24 +494,31 @@ def generate_subtitles_with_speech_recognition(video_path, language, task_id):
         return generate_sample_subtitles(language)
     
     try:
-        # Extract audio from video
-        video = VideoFileClip(video_path)
-        total_duration_ms = int(video.duration * 1000)  # Total duration in milliseconds
-        logger.info(f"Video duration: {format_timestamp(total_duration_ms)} ({total_duration_ms} ms)")
-        
-        audio_path = os.path.join(tempfile.gettempdir(), f"temp_audio_{os.getpid()}.wav")
-        
         # Update task status
         tasks[task_id]['message'] = 'جاري استخراج الصوت من الفيديو...'
+        tasks[task_id]['progress'] = 10
         
-        # Extract audio with higher quality settings
-        video.audio.write_audiofile(audio_path, codec='pcm_s16le', ffmpeg_params=["-ac", "1", "-ar", "44100"])
-        
-        logger.info(f"Extracted audio to: {audio_path}")
+        # Extract audio from video
+        try:
+            video = VideoFileClip(video_path)
+            total_duration_ms = int(video.duration * 1000)  # Total duration in milliseconds
+            logger.info(f"Video duration: {format_timestamp(total_duration_ms)} ({total_duration_ms} ms)")
+            
+            audio_path = os.path.join(tempfile.gettempdir(), f"temp_audio_{os.getpid()}.wav")
+            
+            # Write audio to file with higher quality settings
+            video.audio.write_audiofile(audio_path, codec='pcm_s16le', bitrate='192k', ffmpeg_params=["-ac", "1"], logger=None)
+            logger.info(f"Extracted audio to: {audio_path}")
+            
+            # Close video to free resources
+            video.close()
+        except Exception as e:
+            logger.error(f"Error extracting audio: {str(e)}")
+            raise Exception(f"فشل في استخراج الصوت من الفيديو: {str(e)}")
         
         # Update task status
-        tasks[task_id]['message'] = 'تم استخراج الصوت، جاري تحليل الكلام...'
-        tasks[task_id]['progress'] = 10
+        tasks[task_id]['message'] = 'جاري تحليل الصوت...'
+        tasks[task_id]['progress'] = 20
         
         # Map language code to Google Speech Recognition language code
         language_map = {
@@ -470,6 +540,9 @@ def generate_subtitles_with_speech_recognition(video_path, language, task_id):
         audio_segment = AudioSegment.from_wav(audio_path)
         audio_duration_ms = len(audio_segment)
         logger.info(f"Audio duration: {format_timestamp(audio_duration_ms)} ({audio_duration_ms} ms)")
+        
+        # Apply noise reduction
+        audio_segment = reduce_noise(audio_segment)
         
         # Normalize audio to improve speech recognition
         audio_segment = normalize_audio(audio_segment)
@@ -497,7 +570,8 @@ def generate_subtitles_with_speech_recognition(video_path, language, task_id):
         # If no chunks were created or error occurred, use time-based chunking as fallback
         if len(chunks) <= 1:
             logger.info("Sentence break detection produced too few chunks, falling back to time-based chunking")
-            chunk_length_ms = 2000  # 2 seconds per chunk for better sentence detection
+            # Use smaller chunks for better accuracy
+            chunk_length_ms = 1500  # 1.5 seconds per chunk for better sentence detection
             chunks = [audio_segment[i:i+chunk_length_ms] for i in range(0, len(audio_segment), chunk_length_ms)]
             
             # Recalculate chunk positions
@@ -511,12 +585,12 @@ def generate_subtitles_with_speech_recognition(video_path, language, task_id):
         
         # Process each chunk
         for i, chunk in enumerate(chunks):
-            # Export chunk to a temporary WAV file
+            # Export chunk to a temporary WAV file with high quality
             chunk_path = os.path.join(temp_chunk_dir, f"chunk_{i}.wav")
             chunk.export(chunk_path, format="wav", parameters=["-ac", "1", "-ar", "44100"])
             
             # Update task progress
-            progress = 10 + int((i / len(chunks)) * 80)
+            progress = 20 + int((i / len(chunks)) * 80)
             tasks[task_id]['progress'] = progress
             tasks[task_id]['message'] = f"جاري معالجة المقطع {i+1} من {len(chunks)} ({progress}%)"
             logger.info(f"Processing chunk {i+1}/{len(chunks)} - Progress: {progress}%")
@@ -538,7 +612,7 @@ def generate_subtitles_with_speech_recognition(video_path, language, task_id):
             # Try multiple recognition attempts with different settings
             text = ""
             recognition_attempts = 0
-            max_attempts = 2
+            max_attempts = 3  # Increase max attempts for better accuracy
             
             while not text and recognition_attempts < max_attempts:
                 try:
@@ -546,17 +620,23 @@ def generate_subtitles_with_speech_recognition(video_path, language, task_id):
                         # Adjust for noise if this is a retry
                         if recognition_attempts > 0:
                             logger.info(f"Attempt {recognition_attempts+1} for chunk {i+1} with noise adjustment")
-                            audio_data = recognizer.record(source)
                             recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                            audio_data = recognizer.record(source)
                         else:
                             audio_data = recognizer.record(source)
                         
-                        # Try with higher phrase threshold for better results
-                        if recognition_attempts > 0:
-                            text = recognizer.recognize_google(audio_data, language=speech_language, 
-                                                             show_all=False)
-                        else:
+                        # Try with different settings based on attempt number
+                        if recognition_attempts == 0:
+                            # First attempt: standard recognition
                             text = recognizer.recognize_google(audio_data, language=speech_language)
+                        elif recognition_attempts == 1:
+                            # Second attempt: with higher phrase threshold
+                            text = recognizer.recognize_google(audio_data, language=speech_language, 
+                                                          show_all=False)
+                        else:
+                            # Third attempt: try with a different model
+                            text = recognizer.recognize_google(audio_data, language=speech_language,
+                                                          preferred_phrases=None)
                         
                         if text.strip():
                             logger.info(f"Successfully recognized text in chunk {i+1} on attempt {recognition_attempts+1}")
@@ -607,6 +687,9 @@ def generate_subtitles_with_speech_recognition(video_path, language, task_id):
             return generate_sample_subtitles(language)
         
         logger.info(f"Generated {subtitle_index-1} subtitles")
+        
+        # Post-process subtitles to improve quality
+        srt_content = post_process_subtitles(srt_content, language)
         
         # Update task status
         tasks[task_id]['status'] = 'completed'
@@ -702,6 +785,436 @@ Please make sure the video contains clear speech
 You can try again with another video
 """
 
+def download_youtube_video(youtube_url):
+    """Download a YouTube video and return the path to the downloaded file and video title"""
+    temp_dir = None
+    try:
+        logger.info(f"Downloading YouTube video: {youtube_url}")
+        
+        # Create a temporary directory
+        temp_dir = tempfile.mkdtemp()
+        
+        # Try different download methods in order
+        
+        # Method 1: Try with subprocess (yt-dlp command line)
+        try:
+            logger.info("Attempting to download with subprocess yt-dlp...")
+            video_path, video_title = download_with_subprocess(youtube_url, temp_dir)
+            
+            if video_path and os.path.exists(video_path):
+                logger.info(f"Successfully downloaded with subprocess yt-dlp: {video_path}")
+                return video_path, video_title
+                
+            logger.warning("Subprocess yt-dlp download failed or returned invalid path")
+        except Exception as subprocess_error:
+            logger.error(f"Error with subprocess yt-dlp download: {str(subprocess_error)}")
+        
+        # Method 2: Try with pytube
+        try:
+            logger.info("Attempting to download with pytube...")
+            video_path, video_title = download_with_pytube(youtube_url, temp_dir)
+            
+            if video_path and os.path.exists(video_path):
+                logger.info(f"Successfully downloaded with pytube: {video_path}")
+                return video_path, video_title
+                
+            logger.warning("pytube download failed or returned invalid path")
+        except Exception as pytube_error:
+            logger.error(f"Error with pytube download: {str(pytube_error)}")
+        
+        # Method 3: Try with yt-dlp library
+        if yt_dlp_available:
+            try:
+                logger.info("Attempting to download with yt-dlp library...")
+                video_path, video_title = download_with_yt_dlp(youtube_url, temp_dir)
+                
+                if video_path and os.path.exists(video_path):
+                    logger.info(f"Successfully downloaded with yt-dlp library: {video_path}")
+                    return video_path, video_title
+                    
+                logger.warning("yt-dlp library download failed or returned invalid path")
+            except Exception as yt_dlp_error:
+                logger.error(f"Error with yt-dlp library download: {str(yt_dlp_error)}")
+        
+        # If all methods fail
+        raise Exception("فشلت جميع طرق التنزيل. يرجى التحقق من الرابط والمحاولة مرة أخرى.")
+            
+    except Exception as e:
+        logger.error(f"Error in download_youtube_video: {str(e)}")
+        
+        # Clean up temp directory if download failed
+        try:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+                logger.info(f"Removed temporary directory: {temp_dir}")
+        except Exception as cleanup_error:
+            logger.warning(f"Error cleaning up temporary directory: {str(cleanup_error)}")
+            
+        return None, None
+
+def download_with_pytube(youtube_url, output_path):
+    """Download a YouTube video using pytube"""
+    try:
+        logger.info(f"Downloading YouTube video: {youtube_url}")
+        
+        # Maximum retry attempts
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                # Download YouTube video with error handling
+                yt = YouTube(youtube_url)
+                
+                # Add event handlers for debugging
+                yt.register_on_progress_callback(on_progress)
+                yt.register_on_complete_callback(on_complete)
+                
+                video_title = yt.title if yt.title else "youtube_video"
+                
+                # Sanitize video title for filename
+                video_title = re.sub(r'[^\w\s-]', '', video_title).strip()
+                video_title = re.sub(r'[-\s]+', '-', video_title)
+                
+                # Try different stream types in order of preference
+                stream = None
+                
+                # First try to get a progressive stream (combined audio and video)
+                logger.info("Trying to get progressive stream...")
+                progressive_streams = yt.streams.filter(progressive=True).order_by('resolution').desc()
+                if progressive_streams:
+                    stream = progressive_streams.first()
+                    logger.info(f"Found progressive stream: {stream}")
+                
+                # If no progressive stream, try to get audio stream
+                if not stream:
+                    logger.info("No progressive stream found, trying audio stream...")
+                    audio_streams = yt.streams.filter(only_audio=True)
+                    if audio_streams:
+                        stream = audio_streams.first()
+                        logger.info(f"Found audio stream: {stream}")
+                
+                # If no audio stream, try to get video-only stream
+                if not stream:
+                    logger.info("No audio stream found, trying video-only stream...")
+                    video_streams = yt.streams.filter(only_video=True)
+                    if video_streams:
+                        stream = video_streams.first()
+                        logger.info(f"Found video-only stream: {stream}")
+                
+                if not stream:
+                    raise Exception("No suitable video stream found")
+                
+                logger.info(f"Downloading stream: {stream}")
+                video_path = stream.download(output_path=output_path)
+                
+                logger.info(f"Downloaded YouTube video to: {video_path}")
+                return video_path, video_title
+                
+            except Exception as e:
+                retry_count += 1
+                logger.warning(f"YouTube download attempt {retry_count} failed: {str(e)}")
+                
+                if retry_count >= max_retries:
+                    raise Exception(f"فشل في تنزيل الفيديو بعد {max_retries} محاولات: {str(e)}")
+                
+                # Wait before retrying
+                time.sleep(2)
+        
+        # This should not be reached due to the exception in the loop
+        return None, None
+            
+    except Exception as e:
+        logger.error(f"Error in download_with_pytube: {str(e)}")
+        return None, None
+
+def download_with_yt_dlp(youtube_url, output_path):
+    """Download a YouTube video using yt-dlp as a fallback method"""
+    try:
+        logger.info(f"Attempting to download with yt-dlp: {youtube_url}")
+        
+        if not yt_dlp_available:
+            logger.error("yt-dlp is not available")
+            return None, None
+            
+        # Create a unique filename
+        video_id = str(uuid.uuid4())
+        output_template = os.path.join(output_path, f"{video_id}.%(ext)s")
+        
+        # Configure yt-dlp options
+        ydl_opts = {
+            'format': 'best[ext=mp4]/best',  # Prefer mp4 format
+            'outtmpl': output_template,
+            'noplaylist': True,
+            'quiet': False,
+            'no_warnings': False,
+            'ignoreerrors': False,
+        }
+        
+        # Download the video
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            logger.info("Starting yt-dlp download...")
+            info = ydl.extract_info(youtube_url, download=True)
+            logger.info("yt-dlp download completed")
+            
+            if not info:
+                logger.error("yt-dlp could not extract video info")
+                return None, None
+                
+            # Get video title
+            video_title = info.get('title', 'youtube_video')
+            
+            # Sanitize video title for filename
+            video_title = re.sub(r'[^\w\s-]', '', video_title).strip()
+            video_title = re.sub(r'[-\s]+', '-', video_title)
+            
+            # Get the downloaded file path
+            if 'requested_downloads' in info and info['requested_downloads']:
+                video_path = info['requested_downloads'][0]['filepath']
+            else:
+                # Try to find the file based on the template
+                ext = info.get('ext', 'mp4')
+                video_path = os.path.join(output_path, f"{video_id}.{ext}")
+                
+            if not os.path.exists(video_path):
+                logger.error(f"Downloaded file not found at {video_path}")
+                return None, None
+                
+            logger.info(f"Successfully downloaded video with yt-dlp: {video_path}")
+            return video_path, video_title
+            
+    except Exception as e:
+        logger.error(f"Error downloading with yt-dlp: {str(e)}")
+        return None, None
+
+def download_with_subprocess(youtube_url, output_path):
+    """Download a YouTube video using subprocess to call yt-dlp directly"""
+    try:
+        logger.info(f"Attempting to download with subprocess yt-dlp: {youtube_url}")
+        
+        # Create a unique filename
+        video_id = str(uuid.uuid4())
+        output_template = os.path.join(output_path, f"{video_id}.mp4")
+        
+        # Prepare the command
+        cmd = [
+            "yt-dlp",
+            "--format", "best[ext=mp4]/best",
+            "--output", output_template,
+            "--no-playlist",
+            youtube_url
+        ]
+        
+        logger.info(f"Running command: {' '.join(cmd)}")
+        
+        # Run the command
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Get output
+        stdout, stderr = process.communicate()
+        
+        # Log output
+        if stdout:
+            logger.info(f"yt-dlp stdout: {stdout}")
+        if stderr:
+            logger.warning(f"yt-dlp stderr: {stderr}")
+            
+        # Check if the command was successful
+        if process.returncode != 0:
+            logger.error(f"yt-dlp process failed with return code {process.returncode}")
+            return None, None
+            
+        # Check if the file was created
+        if not os.path.exists(output_template):
+            logger.error(f"yt-dlp did not create the expected output file: {output_template}")
+            
+            # Try to find any mp4 file in the output directory
+            mp4_files = [f for f in os.listdir(output_path) if f.endswith('.mp4')]
+            if mp4_files:
+                output_template = os.path.join(output_path, mp4_files[0])
+                logger.info(f"Found alternative mp4 file: {output_template}")
+            else:
+                return None, None
+                
+        # Extract video title from the output
+        video_title = "youtube_video"
+        for line in stdout.split('\n'):
+            if '[info]' in line and 'Destination:' in line:
+                try:
+                    # Try to extract the filename which might contain the title
+                    filename = line.split('Destination:')[1].strip()
+                    video_title = os.path.splitext(os.path.basename(filename))[0]
+                    break
+                except:
+                    pass
+                    
+        logger.info(f"Successfully downloaded video with subprocess yt-dlp: {output_template}")
+        return output_template, video_title
+        
+    except Exception as e:
+        logger.error(f"Error downloading with subprocess yt-dlp: {str(e)}")
+        return None, None
+
+def on_progress(stream, chunk, bytes_remaining):
+    """Callback function for download progress"""
+    try:
+        total_size = stream.filesize
+        bytes_downloaded = total_size - bytes_remaining
+        percentage = (bytes_downloaded / total_size) * 100
+        logger.info(f"Download progress: {percentage:.2f}%")
+    except Exception as e:
+        logger.error(f"Error in progress callback: {str(e)}")
+
+def on_complete(stream, file_path):
+    """Callback function for download completion"""
+    try:
+        logger.info(f"Download completed: {file_path}")
+    except Exception as e:
+        logger.error(f"Error in complete callback: {str(e)}")
+
+def process_youtube_video(task_id, youtube_url, language):
+    """Process a YouTube video in a background thread"""
+    try:
+        logger.info(f"Starting to process YouTube video: {youtube_url}, task_id: {task_id}")
+        
+        # Update task status
+        tasks[task_id]['message'] = 'جاري تحميل الفيديو من يوتيوب...'
+        tasks[task_id]['progress'] = 5
+        
+        # Download YouTube video
+        video_path, video_title = download_youtube_video(youtube_url)
+        
+        if not video_path:
+            error_msg = "فشل في تحميل الفيديو من يوتيوب. يرجى التحقق من الرابط والمحاولة مرة أخرى."
+            logger.error(f"Failed to download YouTube video: {youtube_url}")
+            tasks[task_id]['status'] = 'error'
+            tasks[task_id]['message'] = error_msg
+            tasks[task_id]['error'] = 'Failed to download YouTube video'
+            return
+        
+        # Update task status
+        tasks[task_id]['message'] = 'تم تحميل الفيديو، جاري معالجة الترجمة...'
+        tasks[task_id]['progress'] = 20
+        
+        # Log video details
+        logger.info(f"Successfully downloaded YouTube video. Title: {video_title}, Path: {video_path}")
+        
+        try:
+            # Generate subtitles
+            subtitles = generate_subtitles_with_speech_recognition(video_path, language, task_id)
+            
+            if not subtitles or len(subtitles.strip()) == 0:
+                logger.warning(f"No subtitles generated for YouTube video {youtube_url}")
+                tasks[task_id]['status'] = 'error'
+                tasks[task_id]['message'] = 'لم يتم التعرف على أي كلام في الفيديو'
+                tasks[task_id]['error'] = 'No speech detected in the video'
+                
+                # Provide fallback subtitles
+                subtitles = generate_sample_subtitles(language)
+                tasks[task_id]['status'] = 'completed'
+                tasks[task_id]['progress'] = 100
+                tasks[task_id]['message'] = 'تم إنشاء ترجمة تلقائية (لم يتم التعرف على كلام)'
+                tasks[task_id]['result'] = {
+                    'srt_content': subtitles,
+                    'filename': f"{video_title}.srt"
+                }
+                return
+            
+            # Update task status
+            tasks[task_id]['status'] = 'completed'
+            tasks[task_id]['progress'] = 100
+            tasks[task_id]['message'] = 'تم إنشاء الترجمة بنجاح'
+            tasks[task_id]['result'] = {
+                'srt_content': subtitles,
+                'filename': f"{video_title}.srt"
+            }
+            
+            logger.info(f"Completed processing YouTube video for task {task_id}")
+        
+        except Exception as subtitle_error:
+            logger.error(f"Error generating subtitles: {str(subtitle_error)}")
+            tasks[task_id]['status'] = 'error'
+            tasks[task_id]['message'] = f'حدث خطأ أثناء إنشاء الترجمة: {str(subtitle_error)}'
+            tasks[task_id]['error'] = str(subtitle_error)
+        
+        # Clean up
+        finally:
+            try:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+                    logger.info(f"Removed temporary video file: {video_path}")
+            except Exception as e:
+                logger.warning(f"Error cleaning up temporary files: {str(e)}")
+        
+    except Exception as e:
+        logger.error(f"Error processing YouTube video: {str(e)}")
+        tasks[task_id]['status'] = 'error'
+        tasks[task_id]['message'] = f'حدث خطأ: {str(e)}'
+        tasks[task_id]['error'] = str(e)
+
+def reduce_noise(audio_segment):
+    """Apply noise reduction to improve speech recognition"""
+    try:
+        # Simple noise reduction by removing very low amplitude parts
+        # This is a basic implementation - for production, consider using more advanced libraries
+        from pydub.effects import high_pass_filter, low_pass_filter
+        
+        # Apply high-pass filter to remove low frequency noise
+        filtered_audio = high_pass_filter(audio_segment, 80)
+        
+        # Apply low-pass filter to remove high frequency noise
+        filtered_audio = low_pass_filter(filtered_audio, 10000)
+        
+        logger.info("Applied noise reduction filters")
+        return filtered_audio
+    except Exception as e:
+        logger.warning(f"Could not apply noise reduction: {e}")
+        return audio_segment
+
+def post_process_subtitles(srt_content, language):
+    """Post-process subtitles to improve quality and readability"""
+    try:
+        # Split content into subtitle blocks
+        subtitle_blocks = srt_content.strip().split('\n\n')
+        processed_blocks = []
+        
+        for block in subtitle_blocks:
+            lines = block.split('\n')
+            if len(lines) >= 3:  # Valid subtitle block has at least 3 lines
+                index = lines[0]
+                timing = lines[1]
+                text = ' '.join(lines[2:])  # Join all text lines
+                
+                # Clean up text based on language
+                if language == 'ar':
+                    # Arabic-specific cleanup
+                    text = text.replace('  ', ' ').strip()
+                    # Fix common Arabic recognition issues
+                    text = text.replace('؟', '?')
+                elif language == 'en':
+                    # English-specific cleanup
+                    text = text.strip()
+                    # Capitalize first letter of sentences
+                    if text and len(text) > 0:
+                        text = text[0].upper() + text[1:]
+                
+                # Rebuild the subtitle block
+                processed_block = f"{index}\n{timing}\n{text}"
+                processed_blocks.append(processed_block)
+        
+        # Join blocks back together
+        processed_content = '\n\n'.join(processed_blocks)
+        logger.info("Post-processed subtitles for improved quality")
+        return processed_content
+    except Exception as e:
+        logger.warning(f"Error in subtitle post-processing: {e}")
+        return srt_content
+
 @app.route('/setup_info')
 def setup_info():
     """Return information about the setup and available features"""
@@ -729,4 +1242,12 @@ def setup_info():
     return jsonify(info)
 
 if __name__ == '__main__':
+    # Add CORS headers to allow requests from any origin
+    @app.after_request
+    def add_cors_headers(response):
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        return response
+        
     app.run(debug=True, host='0.0.0.0', port=5000)
